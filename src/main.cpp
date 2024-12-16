@@ -1,9 +1,34 @@
 #include <Arduino.h>
 #include <HardwareSerial.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
 #include <SensirionI2CScd4x.h>
+
+#define MQTT_MAX_PACKET_SIZE 1024
+
+// WiFi settings
+const char* ssid = "norazlin@unifi";
+const char* password = "bkh223811286";
+
+// MQTT settings
+const char* mqtt_server = "denodev.duckdns.org";
+const int mqtt_port = 1883;
+const char* mqtt_user = "";
+const char* mqtt_password = "";
+const char* mqtt_topic = "sensors/environmental";
+const char* device_id = "env_sensor_01";
+
+// Add LED pin for status indication
+#define LED_PIN 2
+
+// Create WiFi and MQTT clients
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
 // Pin definitions
 #define PMS_RX 16
 #define PMS_TX 17
@@ -17,11 +42,13 @@ TaskHandle_t pmsReadTaskHandle = NULL;
 TaskHandle_t bmeReadTaskHandle = NULL;
 TaskHandle_t scdReadTaskHandle = NULL;
 TaskHandle_t displayTaskHandle = NULL;
+TaskHandle_t mqttTaskHandle = NULL;
 
 // Queue handle for sensor data
 QueueHandle_t pmsDataQueue;
 QueueHandle_t bmeDataQueue;
 QueueHandle_t scdDataQueue;
+QueueHandle_t mqttQueue;
 
 // Mutex for serial communication
 SemaphoreHandle_t serialMutex;
@@ -68,7 +95,55 @@ struct CombinedData {
     bool pmsValid;
     bool bmeValid;
     bool scdValid;
+    unsigned long timestamp;
 };
+
+void setupWiFi() {
+    WiFi.mode(WIFI_STA);  // Set WiFi to station mode
+    WiFi.disconnect();     // Disconnect from any previous connections
+    delay(100);
+    
+    Serial.printf("Connecting to %s", ssid);
+    WiFi.begin(ssid, password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected");
+        Serial.println("IP address: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\nWiFi connection failed!");
+        ESP.restart();  // Restart ESP32 if WiFi connection fails
+    }
+}
+
+void reconnectMQTT() {
+    int attempts = 0;
+    while (!mqttClient.connected() && attempts < 3) {  // Limit retry attempts
+        Serial.print("Attempting MQTT connection...");
+        String clientId = "ESP32Env-" + String(random(0xffff), HEX);
+        
+        if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_password)) {
+            Serial.println("connected");
+            digitalWrite(LED_PIN, HIGH);  // Turn on LED when connected
+            delay(100);
+            digitalWrite(LED_PIN, LOW);
+        } else {
+            Serial.print("failed, rc=");
+            Serial.print(mqttClient.state());
+            Serial.println(" retrying in 5 seconds");
+            attempts++;
+            vTaskDelay(pdMS_TO_TICKS(5000));
+        }
+    }
+}
+
 
 void resetPMSSerial() {
     if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -148,6 +223,75 @@ bool readPMS5003(PMS5003Data &data) {
     data.isValid = true;
 
     return true;
+}
+
+void mqttTask(void* parameter) {
+    CombinedData sensorData;
+    
+    while (1) {
+        // Check WiFi connection first
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi disconnected. Reconnecting...");
+            setupWiFi();
+        }
+        
+        if (xQueueReceive(mqttQueue, &sensorData, portMAX_DELAY) == pdTRUE) {
+            if (!mqttClient.connected()) {
+                reconnectMQTT();
+            }
+            
+            if ((sensorData.pmsValid || sensorData.bmeValid || sensorData.scdValid) && mqttClient.connected()) {
+                DynamicJsonDocument doc(1024);  // Changed from StaticJsonDocument
+                
+                doc["device_id"] = device_id;
+                doc["timestamp"] = sensorData.timestamp;
+                
+                if (sensorData.pmsValid) {
+                    JsonObject pmsData = doc.createNestedObject("pms5003");
+                    pmsData["pm1_0"] = sensorData.pms.pm10_standard;
+                    pmsData["pm2_5"] = sensorData.pms.pm25_standard;
+                    pmsData["pm10_0"] = sensorData.pms.pm100_standard;
+                    pmsData["particles_0_3"] = sensorData.pms.particles_03um;
+                    pmsData["particles_0_5"] = sensorData.pms.particles_05um;
+                    pmsData["particles_1_0"] = sensorData.pms.particles_10um;
+                    pmsData["particles_2_5"] = sensorData.pms.particles_25um;
+                    pmsData["particles_5_0"] = sensorData.pms.particles_50um;
+                    pmsData["particles_10_0"] = sensorData.pms.particles_100um;
+                }
+                
+                if (sensorData.bmeValid) {
+                    JsonObject bmeData = doc.createNestedObject("bme680");
+                    bmeData["temperature"] = round(sensorData.bme.temperature * 100.0) / 100.0;
+                    bmeData["humidity"] = round(sensorData.bme.humidity * 100.0) / 100.0;
+                    bmeData["pressure"] = round(sensorData.bme.pressure * 100.0) / 100.0;
+                    bmeData["gas"] = round(sensorData.bme.gas * 100.0) / 100.0;
+                }
+                
+                if (sensorData.scdValid) {
+                    JsonObject scdData = doc.createNestedObject("scd41");
+                    scdData["co2"] = sensorData.scd.co2;
+                    scdData["temperature"] = round(sensorData.scd.temperature * 100.0) / 100.0;
+                    scdData["humidity"] = round(sensorData.scd.humidity * 100.0) / 100.0;
+                }
+                
+                String jsonString;
+                serializeJson(doc, jsonString);
+                
+                if (mqttClient.publish(mqtt_topic, jsonString.c_str(), false)) {
+                    digitalWrite(LED_PIN, HIGH);
+                    delay(100);
+                    digitalWrite(LED_PIN, LOW);
+                    Serial.println("Published to MQTT:");
+                    Serial.println(jsonString);
+                } else {
+                    Serial.println("Failed to publish to MQTT!");
+                    Serial.printf("MQTT state: %d\n", mqttClient.state());
+                }
+            }
+        }
+        mqttClient.loop();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }
 
 // Task to read PMS5003 sensor
@@ -315,11 +459,13 @@ void displayTask(void *parameter) {
             combinedData.pmsValid = true;
             combinedData.bmeValid = true;
             combinedData.scdValid = true;
+            combinedData.timestamp = millis();
             haveAllData = true;
         }
         
         // Only display if we have data from all sensors
         if (haveAllData) {
+            
             readCount++;
             
             if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -350,6 +496,8 @@ void displayTask(void *parameter) {
                 Serial.printf("Humidity: %.2f %%\n", combinedData.scd.humidity);
                 
                 Serial.println("-------------------");
+
+                xQueueSend(mqttQueue, &combinedData, 0);
                 xSemaphoreGive(serialMutex);
             }
         }
@@ -361,6 +509,14 @@ void displayTask(void *parameter) {
 void setup() {
     Serial.begin(115200);
     delay(1000);
+
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
+    mqttClient.setBufferSize(1024);
+    setupWiFi();
+    mqttClient.setServer(mqtt_server, mqtt_port);
+    mqttClient.setKeepAlive(60);
     
     Serial.println("Starting sensor initialization...");
     
@@ -400,6 +556,7 @@ void setup() {
     pmsDataQueue = xQueueCreate(5, sizeof(PMS5003Data));
     bmeDataQueue = xQueueCreate(5, sizeof(BME680Data));
     scdDataQueue = xQueueCreate(5, sizeof(SCD41Data));
+    mqttQueue = xQueueCreate(5, sizeof(CombinedData));
     
     // Initialize PMS sensor
     pmsSensor.begin(PMS_BAUD, SERIAL_8N1, PMS_RX, PMS_TX);
@@ -443,6 +600,16 @@ void setup() {
         1,
         &displayTaskHandle,
         0
+    );
+
+    xTaskCreatePinnedToCore(
+        mqttTask,
+        "MQTT Task",
+        8192, 
+        NULL,
+        1,
+        &mqttTaskHandle,
+        1
     );
     
     Serial.println("Sensor initialization completed");
