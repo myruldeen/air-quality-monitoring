@@ -3,6 +3,7 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
+#include <SensirionI2CScd4x.h>
 // Pin definitions
 #define PMS_RX 16
 #define PMS_TX 17
@@ -14,11 +15,13 @@
 // Task handles
 TaskHandle_t pmsReadTaskHandle = NULL;
 TaskHandle_t bmeReadTaskHandle = NULL;
+TaskHandle_t scdReadTaskHandle = NULL;
 TaskHandle_t displayTaskHandle = NULL;
 
 // Queue handle for sensor data
 QueueHandle_t pmsDataQueue;
 QueueHandle_t bmeDataQueue;
+QueueHandle_t scdDataQueue;
 
 // Mutex for serial communication
 SemaphoreHandle_t serialMutex;
@@ -27,6 +30,7 @@ SemaphoreHandle_t wireMutex;
 // Hardware Serial for PMS sensor
 HardwareSerial pmsSensor(2);
 Adafruit_BME680 bme;
+SensirionI2CScd4x scd4x;
 
 // Structure to hold PMS5003 data
 struct PMS5003Data {
@@ -48,12 +52,22 @@ struct BME680Data {
     bool isValid;
 };
 
+// Structure for SCD41 data
+struct SCD41Data {
+    uint16_t co2;
+    float temperature;
+    float humidity;
+    bool isValid;
+};
+
 // Structure to hold combined sensor data
 struct CombinedData {
     PMS5003Data pms;
     BME680Data bme;
+    SCD41Data scd;
     bool pmsValid;
     bool bmeValid;
+    bool scdValid;
 };
 
 void resetPMSSerial() {
@@ -230,36 +244,82 @@ void bmeReadTask(void *parameter) {
     }
 }
 
+// Task to read SCD41 sensor
+void scdReadTask(void *parameter) {
+    SCD41Data sensorData;
+    static unsigned long failedReads = 0;
+    
+    while (1) {
+        sensorData.isValid = false;
+        
+        if (xSemaphoreTake(wireMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            uint16_t co2;
+            float temperature;
+            float humidity;
+            uint16_t error;
+            
+            error = scd4x.readMeasurement(co2, temperature, humidity);
+            
+            if (error == 0) {
+                sensorData.co2 = co2;
+                sensorData.temperature = temperature;
+                sensorData.humidity = humidity;
+                sensorData.isValid = true;
+                failedReads = 0;
+                
+                if (xQueueSend(scdDataQueue, &sensorData, 0) != pdTRUE) {
+                    xQueueReset(scdDataQueue);
+                    xQueueSend(scdDataQueue, &sensorData, 0);
+                }
+            } else {
+                failedReads++;
+                if (failedReads > 5) {
+                    if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        Serial.println("SCD41 read failed multiple times!");
+                        xSemaphoreGive(serialMutex);
+                    }
+                    // Try to reinitialize
+                    scd4x.stopPeriodicMeasurement();
+                    delay(500);
+                    scd4x.startPeriodicMeasurement();
+                    failedReads = 0;
+                }
+            }
+            xSemaphoreGive(wireMutex);
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(5000)); // SCD41 needs about 5 seconds between measurements
+    }
+}
+
 // Task to display sensor data
 void displayTask(void *parameter) {
     CombinedData combinedData;
     static unsigned long readCount = 0;
-    const TickType_t xMaxWait = pdMS_TO_TICKS(2000);  // 2 second timeout
+    const TickType_t xMaxWait = pdMS_TO_TICKS(5000);  // Increased timeout for SCD41
     
     while (1) {
         // Clear previous state
         combinedData.pmsValid = false;
         combinedData.bmeValid = false;
+        combinedData.scdValid = false;
         
-        // Try to get both sensor data
-        bool haveBothData = false;
+        // Try to get all sensor data
+        bool haveAllData = false;
         
-        // Wait for both sensors to have data
-        if (xQueueReceive(pmsDataQueue, &combinedData.pms, xMaxWait) == pdTRUE) {
-            combinedData.pmsValid = true;
+        // Wait for all sensors to have data
+        if (xQueueReceive(pmsDataQueue, &combinedData.pms, xMaxWait) == pdTRUE &&
+            xQueueReceive(bmeDataQueue, &combinedData.bme, xMaxWait) == pdTRUE &&
+            xQueueReceive(scdDataQueue, &combinedData.scd, xMaxWait) == pdTRUE) {
             
-            // If we got PMS data, try to get BME data
-            if (xQueueReceive(bmeDataQueue, &combinedData.bme, xMaxWait) == pdTRUE) {
-                combinedData.bmeValid = true;
-                haveBothData = true;
-            } else {
-                // If we didn't get BME data, skip this cycle
-                continue;
-            }
+            combinedData.pmsValid = true;
+            combinedData.bmeValid = true;
+            combinedData.scdValid = true;
+            haveAllData = true;
         }
         
-        // Only display if we have data from both sensors
-        if (haveBothData) {
+        // Only display if we have data from all sensors
+        if (haveAllData) {
             readCount++;
             
             if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -278,88 +338,70 @@ void displayTask(void *parameter) {
                 Serial.printf(">5.0um: %u\n", combinedData.pms.particles_50um);
                 Serial.printf(">10um:  %u\n", combinedData.pms.particles_100um);
                 
-                Serial.println("\nEnvironmental Data:");
+                Serial.println("\nBME680 Environmental Data:");
                 Serial.printf("Temperature: %.2f °C\n", combinedData.bme.temperature);
                 Serial.printf("Humidity: %.2f %%\n", combinedData.bme.humidity);
                 Serial.printf("Pressure: %.2f hPa\n", combinedData.bme.pressure);
                 Serial.printf("Gas Resistance: %.2f kΩ\n", combinedData.bme.gas);
+                
+                Serial.println("\nSCD41 CO2 Data:");
+                Serial.printf("CO2: %u ppm\n", combinedData.scd.co2);
+                Serial.printf("Temperature: %.2f °C\n", combinedData.scd.temperature);
+                Serial.printf("Humidity: %.2f %%\n", combinedData.scd.humidity);
                 
                 Serial.println("-------------------");
                 xSemaphoreGive(serialMutex);
             }
         }
         
-        // Small delay before next iteration
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
 void setup() {
-    // Initialize Serial for debugging
     Serial.begin(115200);
     delay(1000);
     
-    Serial.println("Starting PMS5003 RTOS initialization...");
-
+    Serial.println("Starting sensor initialization...");
+    
     Wire.begin(I2C_SDA, I2C_SCL);
-    delay(100); // Give I2C time to stabilize
     
-    Serial.println("Attempting to initialize BME680...");
-    
-    // Try both possible I2C addresses
-    if (!bme.begin(0x76)) {
-        Serial.println("Failed with address 0x76, trying 0x77...");
-        if (!bme.begin(0x77)) {
-            Serial.println("Could not find a valid BME680 sensor on either address!");
-            Serial.println("Check your wiring and I2C address!");
-        } else {
-            Serial.println("BME680 found at address 0x77");
-        }
+    // Initialize BME680
+    if (!bme.begin()) {
+        Serial.println("Could not find BME680 sensor!");
     } else {
-        Serial.println("BME680 found at address 0x76");
+        Serial.println("BME680 initialized");
+        bme.setTemperatureOversampling(BME680_OS_8X);
+        bme.setHumidityOversampling(BME680_OS_2X);
+        bme.setPressureOversampling(BME680_OS_4X);
+        bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
+        bme.setGasHeater(320, 150);
     }
     
-    // Verify I2C connection
-    Wire.beginTransmission(0x76);
-    byte error = Wire.endTransmission();
-    Serial.printf("I2C Error status for 0x76: %d\n", error);
-    // 0 = success
-    // 2 = received NACK on transmit of address
-    // 3 = received NACK on transmit of data
-    // 4 = other error
+    // Initialize SCD41
+    scd4x.begin(Wire);
     
-    Wire.beginTransmission(0x77);
-    error = Wire.endTransmission();
-    Serial.printf("I2C Error status for 0x77: %d\n", error);
+    // Stop potentially previously started measurement
+    scd4x.stopPeriodicMeasurement();
+    delay(500);
     
-    if (bme.begin()) {
-        Serial.println("BME680 initialized successfully");
-        Serial.println("Configuring BME680 settings...");
-        
-        // Configure with error checking
-        bool success = true;
-        success &= bme.setTemperatureOversampling(BME680_OS_8X);
-        success &= bme.setHumidityOversampling(BME680_OS_2X);
-        success &= bme.setPressureOversampling(BME680_OS_4X);
-        success &= bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-        success &= bme.setGasHeater(320, 150);
-        
-        if (success) {
-            Serial.println("BME680 configuration successful");
-        } else {
-            Serial.println("Failed to configure some BME680 settings!");
-        }
+    // Start periodic measurement
+    uint16_t error = scd4x.startPeriodicMeasurement();
+    if (error) {
+        Serial.println("Error starting SCD41 measurement!");
+    } else {
+        Serial.println("SCD41 initialized");
     }
     
-    // Create mutex for serial communication
+    // Create mutexes and queues
     serialMutex = xSemaphoreCreateMutex();
     wireMutex = xSemaphoreCreateMutex();
     
-    // Create queue for sensor data
     pmsDataQueue = xQueueCreate(5, sizeof(PMS5003Data));
     bmeDataQueue = xQueueCreate(5, sizeof(BME680Data));
+    scdDataQueue = xQueueCreate(5, sizeof(SCD41Data));
     
-    // Initialize PMS sensor serial
+    // Initialize PMS sensor
     pmsSensor.begin(PMS_BAUD, SERIAL_8N1, PMS_RX, PMS_TX);
     
     // Create tasks
@@ -372,7 +414,7 @@ void setup() {
         &pmsReadTaskHandle,
         1
     );
-
+    
     xTaskCreatePinnedToCore(
         bmeReadTask,
         "BME Read Task",
@@ -380,6 +422,16 @@ void setup() {
         NULL,
         2,
         &bmeReadTaskHandle,
+        1
+    );
+    
+    xTaskCreatePinnedToCore(
+        scdReadTask,
+        "SCD Read Task",
+        4096,
+        NULL,
+        2,
+        &scdReadTaskHandle,
         1
     );
     
@@ -393,7 +445,7 @@ void setup() {
         0
     );
     
-    Serial.println("PMS5003 RTOS initialization completed");
+    Serial.println("Sensor initialization completed");
 }
 
 void loop() {
