@@ -7,8 +7,18 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
 #include <SensirionI2CScd4x.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 #define MQTT_MAX_PACKET_SIZE 1024
+
+// OLED display settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1  // Reset pin (-1 if sharing Arduino reset pin)
+#define SCREEN_ADDRESS 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // WiFi settings
 const char* ssid = "norazlin@unifi";
@@ -97,6 +107,17 @@ struct CombinedData {
     bool scdValid;
     unsigned long timestamp;
 };
+
+void setupDisplay() {
+    if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+        Serial.println(F("SSD1306 allocation failed"));
+        return;
+    }
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.display();
+}
 
 void setupWiFi() {
     WiFi.mode(WIFI_STA);  // Set WiFi to station mode
@@ -440,7 +461,10 @@ void scdReadTask(void *parameter) {
 void displayTask(void *parameter) {
     CombinedData combinedData;
     static unsigned long readCount = 0;
-    const TickType_t xMaxWait = pdMS_TO_TICKS(5000);  // Increased timeout for SCD41
+    const TickType_t xMaxWait = pdMS_TO_TICKS(5000); 
+    static uint8_t displayPage = 0; 
+    static unsigned long lastPageChange = 0;
+    const unsigned long PAGE_DURATION = 3000;
     
     while (1) {
         // Clear previous state
@@ -467,6 +491,76 @@ void displayTask(void *parameter) {
         if (haveAllData) {
             
             readCount++;
+
+            // Update OLED Display
+            display.clearDisplay();
+            display.setTextSize(1);
+            display.setTextColor(SSD1306_WHITE);
+            display.cp437(true);
+
+            // Rotate between different pages based on time
+            if (millis() - lastPageChange >= PAGE_DURATION) {
+                displayPage = (displayPage + 1) % 3;  // Cycle through 3 pages
+                lastPageChange = millis();
+            }
+
+            switch(displayPage) {
+                case 0:  // PM Data
+                    display.setCursor(0,0);
+                    display.println("Air Quality Data");
+                    display.println("---------------");
+                    display.printf("PM1.0: %u ug/m3\n", combinedData.pms.pm10_standard);
+                    display.printf("PM2.5: %u ug/m3\n", combinedData.pms.pm25_standard);
+                    display.printf("PM10:  %u ug/m3\n", combinedData.pms.pm100_standard);
+                    
+                    // Show air quality status
+                    display.println("\nStatus:");
+                    if(combinedData.pms.pm25_standard <= 12) {
+                        display.println("GOOD");
+                    } else if(combinedData.pms.pm25_standard <= 35) {
+                        display.println("MODERATE");
+                    } else if(combinedData.pms.pm25_standard <= 55) {
+                        display.println("POOR");
+                    } else {
+                        display.println("UNHEALTHY");
+                    }
+                    break;
+
+                case 1:  // Environmental Data
+                    display.setCursor(0,0);
+                    display.println("Environmental");
+                    display.println("---------------");
+                    display.printf("Temp: %.1fC\n", combinedData.bme.temperature);
+                    display.printf("RH: %.1f%%\n", combinedData.bme.humidity);
+                    display.printf("Press: %.0fhPa\n", combinedData.bme.pressure);
+                    display.printf("Gas: %.1fkR\n", combinedData.bme.gas);
+                    break;
+
+                case 2:  // CO2 Data
+                    display.setCursor(0,0);
+                    display.println("CO2 Levels");
+                    display.println("---------------");
+                    display.printf("CO2: %u ppm\n", combinedData.scd.co2);
+                    display.printf("Temp: %.1fC\n", combinedData.scd.temperature);
+                    display.printf("RH: %.1f%%\n", combinedData.scd.humidity);
+                    
+                    // Show CO2 status
+                    display.println("\nStatus:");
+                    if(combinedData.scd.co2 <= 800) {
+                        display.println("GOOD");
+                    } else if(combinedData.scd.co2 <= 1000) {
+                        display.println("MODERATE");
+                    } else {
+                        display.println("POOR");
+                    }
+                    break;
+            }
+            
+            // Show page indicator at bottom
+            // display.setCursor(0, 56);
+            // display.printf("Page %d/3", displayPage + 1);
+            
+            display.display();
             
             if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
                 Serial.printf("\nRead #%lu\n", readCount);
@@ -521,6 +615,15 @@ void setup() {
     Serial.println("Starting sensor initialization...");
     
     Wire.begin(I2C_SDA, I2C_SCL);
+
+    // Initialize OLED
+    setupDisplay();
+
+    // Display startup message
+    display.clearDisplay();
+    display.setCursor(0,0);
+    display.println("Starting up...");
+    display.display();
     
     // Initialize BME680
     if (!bme.begin()) {
@@ -548,6 +651,13 @@ void setup() {
     } else {
         Serial.println("SCD41 initialized");
     }
+
+    // Update startup status
+    display.clearDisplay();
+    display.setCursor(0,0);
+    display.println("Sensors ready!");
+    display.println("Reading data...");
+    display.display();
     
     // Create mutexes and queues
     serialMutex = xSemaphoreCreateMutex();
