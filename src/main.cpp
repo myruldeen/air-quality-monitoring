@@ -21,8 +21,8 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // WiFi settings
-const char* ssid = "norazlin@unifi";
-const char* password = "bkh223811286";
+const char* ssid = "";
+const char* password = "";
 
 // MQTT settings
 const char* mqtt_server = "denodev.duckdns.org";
